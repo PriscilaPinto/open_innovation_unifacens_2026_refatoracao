@@ -3,15 +3,24 @@ Framework Autônomo de Remediação SCA
 A IA é o cérebro: após o Trivy fazer o scan, o agente decide e orquestra tudo.
 
 Requisitos implementados:
-  Req 1  - Análise do repositório
+  Req 1  - Análise do repositório (agora suporta repositórios externos)
   Req 2  - Varredura inicial (Trivy)
   Req 3  - Análise orientada por IA + consulta OSV
-  Req 4  - Aplicação automatizada de patches (branch fix-remediation)
+  Req 4  - Aplicação automatizada de patches (branch fix-remediation no repo alvo)
   Req 5  - Validação pós-remediação (re-scan Trivy)
   Req 8  - Smoke test de estabilidade PHP
   Req 10 - Tratamento de erros, logs detalhados, retry
   Req 11 - Configuração via variáveis de ambiente
   Req 12 - Histórico completo no Supabase
+
+FLUXO REFATORADO:
+  1. Recebe URL do repositório legado (TARGET_REPO_URL)
+  2. Clona o repositório para diretório temporário
+  3. Executa Trivy sobre o repositório clonado
+  4. framework.py processa estágios 1-4 no diretório clonado
+  5. Correções aplicadas no repositório clonado
+  6. Commit e push das correções para o repositório alvo
+  7. Diretório temporário é limpo
 """
 import os
 import sys
@@ -19,6 +28,7 @@ import json
 import time
 import subprocess
 import shutil
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -28,11 +38,19 @@ load_dotenv()
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
 from db import connect_db
-from context_collector import detect_ecosystem, detect_ecosystems
+from context_collector import (
+    detect_ecosystem, detect_ecosystems,
+    clone_target_repository, cleanup_target_repository,
+    commit_and_push_patches
+)
 
 # Req 11: configuração via env com defaults seguros
-MIN_SEVERITY     = os.getenv("MIN_SEVERITY", "HIGH")        # severidade mínima para remediar
-TRIVY_RETRIES    = int(os.getenv("TRIVY_RETRIES", "3"))     # Req 2.5: retry do scanner
+MIN_SEVERITY     = os.getenv("MIN_SEVERITY", "HIGH")
+
+# Configuração do repositório alvo
+TARGET_REPO_URL  = os.getenv("TARGET_REPO_URL", "")
+TARGET_REPO_BRANCH = os.getenv("TARGET_REPO_BRANCH", "main")
+TARGET_BRANCH_FIX = os.getenv("TARGET_BRANCH_FIX", "fix-remediation")
 
 # Package managers por ecossistema
 PACKAGE_MANAGERS = {
@@ -51,11 +69,25 @@ def get_ai_agent():
     """Import lazy — falha visível no log, nunca silenciosa."""
     try:
         from ai_agent import analisar_lote
-        log("Agente de IA carregado (OpenRouter/Gemini)")
+        log("Agente de IA carregado (Google Gemini)")
         return analisar_lote
     except Exception as e:
         log(f"Agente de IA não disponível: {e}. Usando fallback por severidade.", "WARN")
         return None
+
+
+def get_target_repo_name():
+    """Extrai nome do repositório da URL para registro no banco."""
+    if not TARGET_REPO_URL:
+        return os.getenv("GITHUB_REPOSITORY", "local")
+    # Extrai "owner/repo" de URLs como:
+    # https://github.com/owner/repo.git
+    # git@github.com:owner/repo.git
+    url = TARGET_REPO_URL.rstrip(".git")
+    if "github.com" in url:
+        parts = url.split("github.com/")[-1].split(":")
+        return parts[-1] if parts else url
+    return url
 
 
 # ============================================================
@@ -103,40 +135,67 @@ def db_finish_execution(conn, execution_id, status, found, resolved):
 
 
 # ============================================================
-# STAGE 1: Leitura do relatório Trivy + OSV + Supabase
-# Req 1, 2, 3.2, 12
-# 
-# NOTA: As consultas OSV e banco curado são delegadas ao
-#       persist_history.py para consistência. As funções
-#       query_osv() e query_curated() que existiam aqui
-#       como dead code foram removidas.
+# STAGE 0: Clonar repositório alvo
 # ============================================================
-def stage1_load_and_persist(conn, report_path="reports/report.json"):
+def stage0_clone_target():
     """
-    Req 1, 2, 12: lê relatório, enriquece com OSV/curado e persiste.
-    AGORA: Multi-linguagem verdadeiro — detecta ecossistema de CADA resultado Trivy
+    Req 1: Clona o repositório legado alvo para análise.
     
-    Utiliza persist_history.py para:
-    - Req 3: Consulta OSV API com fallback
-    - Req 12: Rastreamento de source_db (CURATED_DB vs OSV_API)
-    - Req 5: Evita duplicação de registros
+    Se TARGET_REPO_URL não estiver configurado, usa o diretório atual
+    (compatibilidade com execução local/dentro do próprio repo).
+    
+    Retorna:
+        (target_path, target_repo_name)
     """
     log("=" * 60)
-    log("STAGE 1 — Leitura do Trivy Report + Persistência Supabase (Multi-Linguagem)")
+    log("STAGE 0 — Clonando Repositório Alvo")
     log("=" * 60)
 
-    # Req 1.4/1.5: verifica arquivo
+    if not TARGET_REPO_URL:
+        log("TARGET_REPO_URL não configurado — usando diretório atual")
+        return os.getcwd(), get_target_repo_name()
+
+    repo_name = get_target_repo_name()
+    log(f"📦 Repositório alvo: {TARGET_REPO_URL} (branch: {TARGET_REPO_BRANCH})")
+
+    target_path = clone_target_repository(TARGET_REPO_URL, TARGET_REPO_BRANCH)
+    if not target_path:
+        log(f"❌ Falha ao clonar repositório {TARGET_REPO_URL}", "ERROR")
+        sys.exit(1)
+
+    log(f"✅ Repositório clonado em: {target_path}")
+    return target_path, repo_name
+
+
+# ============================================================
+# STAGE 1: Leitura do relatório Trivy + OSV + Supabase
+# ============================================================
+def stage1_load_and_persist(conn, target_path, report_path="reports/report.json"):
+    """
+    Req 1, 2, 12: lê relatório do Trivy a partir do target_path,
+    enriquece com OSV/curado e persiste no Supabase.
+    
+    Args:
+        conn: Conexão com o banco
+        target_path: Caminho do repositório alvo clonado
+        report_path: Caminho do relatório (relativo ao CWD do framework)
+    """
+    log("=" * 60)
+    log("STAGE 1 — Leitura do Trivy Report + Persistência Supabase")
+    log(f"     Alvo: {target_path}")
+    log("=" * 60)
+
     if not os.path.exists(report_path):
         log(f"Relatório não encontrado: {report_path}", "ERROR")
         sys.exit(1)
 
     run_id = os.getenv("GITHUB_RUN_ID", f"local-{int(time.time())}")
-    repo   = os.getenv("GITHUB_REPOSITORY", "local")
+    repo   = get_target_repo_name()
 
     # Cria execução
     execution_id = db_safe(db_create_execution, conn, repo, run_id)
     if execution_id:
-        log(f"Execução criada no Supabase: {execution_id}")
+        log(f"Execução criada no Supabase: {execution_id} (repositório: {repo})")
 
     with open(report_path) as f:
         report = json.load(f)
@@ -165,7 +224,6 @@ def stage1_load_and_persist(conn, report_path="reports/report.json"):
     count = 0
 
     for result in all_results:
-        # Detecta ecossistema DESTA vulnerabilidade (baseado em Type do Trivy)
         result_type = result.get("Type", "").lower()
         
         # Map Trivy type → nosso ecosystem
@@ -243,14 +301,12 @@ def stage1_load_and_persist(conn, report_path="reports/report.json"):
     
     conn.commit()
     cur.close()
-    log(f"✅ {count} vulnerabilidades salvas no Supabase (sem duplicatas, multi-linguagem)")
+    log(f"✅ {count} vulnerabilidades salvas no Supabase (repositório: {repo})")
     return execution_id, count
 
 
 # ============================================================
 # STAGE 2: Agente de IA analisa e decide
-# Req 3: análise orientada por IA
-# AGORA: Agrupa vulnerabilidades por ecossistema também
 # ============================================================
 def stage2_ai_decide(conn):
     log("=" * 60)
@@ -297,7 +353,6 @@ def stage2_ai_decide(conn):
     approved = manual = ignored = 0
     cur = conn.cursor()
 
-    # Processa cada ecossistema
     for ecosystem, vulns in by_ecosystem.items():
         log(f"\n{ecosystem}:")
         log(f"  📊 {len(vulns)} vulnerabilidade(s)")
@@ -316,7 +371,6 @@ def stage2_ai_decide(conn):
                     elif decision == "IGNORE":   ignored  += 1
                     else:                        manual   += 1
 
-                    # Atualiza todos os registros do pacote com a decisão da IA
                     cur.execute("""
                         UPDATE vulnerability_records
                         SET decision_status=%s, ai_justification=%s,
@@ -334,7 +388,6 @@ def stage2_ai_decide(conn):
                 log(f"  Agente de IA falhou: {e}. Usando fallback.", "WARN")
                 conn.rollback()
                 
-                # Fallback por severidade para este ecossistema
                 log(f"  Usando regras de severidade como fallback para {ecosystem}...")
                 seen = set()
                 for vuln in vulns:
@@ -345,7 +398,6 @@ def stage2_ai_decide(conn):
                     sev = vuln["severity"]
                     rec = vuln["recommended_version"]
 
-                    # HIGH/CRITICAL sempre aprova (composer update faz o resto)
                     if sev in ("CRITICAL", "HIGH"):
                         dec = "APPROVED";      approved += 1
                     elif sev == "LOW":
@@ -364,7 +416,6 @@ def stage2_ai_decide(conn):
                 
                 conn.commit()
         else:
-            # Sem IA — apenas severidade
             log(f"  Sem agente de IA — usando regras de severidade para {ecosystem}...")
             seen = set()
             for vuln in vulns:
@@ -375,7 +426,6 @@ def stage2_ai_decide(conn):
                 sev = vuln["severity"]
                 rec = vuln["recommended_version"]
 
-                # HIGH/CRITICAL sempre aprova (composer update faz o resto)
                 if sev in ("CRITICAL", "HIGH"):
                     dec = "APPROVED";      approved += 1
                 elif sev == "LOW":
@@ -400,9 +450,7 @@ def stage2_ai_decide(conn):
 
 
 # ============================================================
-# STAGE 3: Aplicação dos patches
-# Req 4: aplicação automatizada
-# AGORA: Processa cada ecossistema com seu package manager
+# STAGE 3: Aplicação dos patches NO REPOSITÓRIO ALVO
 # ============================================================
 COMMANDS = {
     "composer": lambda pkg, ver: ["composer", "require", f"{pkg}:{ver}", "--no-interaction"],
@@ -411,23 +459,23 @@ COMMANDS = {
 }
 
 
-def run_smoke_test(ecosystem):
-    """Executa smoke test básico para validar estabilidade pós-patch."""
+def run_smoke_test(ecosystem, target_path):
+    """
+    Executa smoke test básico no target_path para validar estabilidade pós-patch.
+    """
     if ecosystem == "PHP":
-        # Valida sintaxe de todos os arquivos PHP
         result = subprocess.run(
-            "for f in $(find . -name '*.php' -not -path './vendor/*'); do php -l $f 2>&1 || exit 1; done",
+            f"for f in $(find {target_path} -name '*.php' -not -path '*/vendor/*'); do php -l $f 2>&1 || exit 1; done",
             shell=True, capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0:
             log(f"      ❌ Smoke test PHP falhou: {result.stderr[:200]}", "WARN")
             return False
         
-        # Tenta composer install para verificar dependências
-        if os.path.exists("composer.json"):
+        if os.path.exists(os.path.join(target_path, "composer.json")):
             result = subprocess.run(
                 ["composer", "install", "--no-interaction", "--no-progress", "--prefer-dist"],
-                capture_output=True, text=True, timeout=120
+                cwd=target_path, capture_output=True, text=True, timeout=120
             )
             if result.returncode != 0:
                 log(f"      ❌ Smoke test composer falhou: {result.stderr[:200]}", "WARN")
@@ -436,32 +484,44 @@ def run_smoke_test(ecosystem):
         return True
     
     elif ecosystem == "Node.js":
-        # Valida sintaxe com node --check
         result = subprocess.run(
-            "for f in $(find . -name '*.js' -not -path './node_modules/*'); do node --check $f 2>&1 || exit 1; done",
+            f"for f in $(find {target_path} -name '*.js' -not -path '*/node_modules/*'); do node --check $f 2>&1 || exit 1; done",
             shell=True, capture_output=True, text=True, timeout=60
         )
         return result.returncode == 0
     
     elif ecosystem == "Python":
-        # Valida sintaxe Python
         result = subprocess.run(
-            "python -m py_compile $(find . -name '*.py' -not -path './venv/*' -not -path './env/*') 2>&1 || true",
+            f"python -m py_compile $(find {target_path} -name '*.py' -not -path '*/venv/*' -not -path '*/env/*') 2>&1 || true",
             shell=True, capture_output=True, text=True, timeout=60
         )
-        return True  # Não bloqueante para Python
+        return True
     
     return True
 
 
-def stage3_apply_patches(conn):
+def get_virtual_patch_dir(target_path):
+    """Cria e retorna diretório de virtual patches no target_path."""
+    patch_dir = os.path.join(target_path, "virtual_patches")
+    os.makedirs(patch_dir, exist_ok=True)
+    return patch_dir
+
+
+def stage3_apply_patches(conn, target_path):
+    """
+    Aplica patches de dependências no diretório do repositório alvo.
+    
+    Args:
+        conn: Conexão com o banco
+        target_path: Caminho do repositório alvo clonado
+    """
     log("=" * 60)
-    log("STAGE 3 — Aplicação de Patches com Virtual Patching (Multi-Linguagem)")
+    log("STAGE 3 — Aplicação de Patches no Repositório Alvo")
+    log(f"     Alvo: {target_path}")
     log("=" * 60)
 
     cur = conn.cursor()
     
-    # Busca TODOS os ecossistemas com vulnerabilidades aprovadas
     cur.execute("""
         SELECT DISTINCT ecosystem
         FROM vulnerability_records
@@ -481,7 +541,6 @@ def stage3_apply_patches(conn):
     
     total_remediated = total_failed = total_virtual_patched = 0
     
-    # Processa cada ecossistema
     for ecosystem in ecosystems:
         pm = PACKAGE_MANAGERS.get(ecosystem)
         if not pm:
@@ -496,7 +555,6 @@ def stage3_apply_patches(conn):
             log(f"  ❌ {pm} não encontrado no PATH", "ERROR")
             continue
         
-        # Busca vulnerabilidades APPROVED deste ecossistema
         cur.execute("""
             SELECT DISTINCT ON (package_name)
                 id, package_name, installed_version, recommended_version, ai_justification
@@ -516,31 +574,29 @@ def stage3_apply_patches(conn):
         remediated = failed = virtual_patched = 0
         
         for _, pkg, old_ver, new_ver, justif in rows:
-            # Se new_ver for None, usar "update" genérico
             if new_ver:
                 log(f"    {pkg}: {old_ver} → {new_ver}")
                 cmd = COMMANDS[pm](pkg, new_ver)
             else:
                 log(f"    {pkg}: {old_ver} → (update genérico)")
-                # Fallback: atualizar especificamente este pacote (qualquer versão nova)
                 if pm == "composer":
                     cmd = ["composer", "update", pkg, "--no-interaction"]
                 elif pm == "npm":
                     cmd = ["npm", "update", pkg]
-                else:  # pip
+                else:
                     cmd = ["pip", "install", "--upgrade", pkg]
             
             if justif:
                 log(f"      Justificativa: {justif[:100]}")
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # Executa o comando NO DIRETÓRIO DO REPOSITÓRIO ALVO
+            result = subprocess.run(cmd, cwd=target_path, capture_output=True, text=True)
 
             if result.returncode == 0:
                 log(f"      ✅ Update aplicado com sucesso")
                 
-                # === SMOKE TEST PÓS-UPDATE ===
-                log(f"      🔍 Executando smoke test para validar estabilidade...")
-                smoke_ok = run_smoke_test(ecosystem)
+                log(f"      🔍 Executando smoke test...")
+                smoke_ok = run_smoke_test(ecosystem, target_path)
                 
                 if smoke_ok:
                     log(f"      ✅ Smoke test passou — patch confirmado")
@@ -554,23 +610,21 @@ def stage3_apply_patches(conn):
                     """, (pkg, ecosystem))
                     remediated += 1
                 else:
-                    # === VIRTUAL PATCH: update quebrou compatibilidade ===
-                    log(f"      ⚠️  Smoke test FALHOU após update — aplicando Virtual Patch", "WARN")
+                    log(f"      ⚠️  Smoke test FALHOU — aplicando Virtual Patch", "WARN")
                     
-                    # Reverte o update (git checkout nos arquivos de dependência)
-                    log(f"      ↩️  Revertendo update de {pkg}...")
+                    # Reverte usando git no target_path
+                    log(f"      ↩️  Revertendo update...")
                     subprocess.run(
-                        ["git", "checkout", "--", "composer.json", "composer.lock",
+                        ["git", "checkout", "--",
+                         "composer.json", "composer.lock",
                          "package.json", "package-lock.json", "requirements.txt"],
-                        capture_output=True, text=True
+                        cwd=target_path, capture_output=True, text=True
                     )
                     
-                    # Gera virtual patch via IA
-                    log(f"      🧠 Gerando Virtual Patch via IA para {pkg}...")
+                    log(f"      🧠 Gerando Virtual Patch...")
                     try:
                         from ai_agent import gerar_virtual_patch
                         
-                        # Busca CVEs associadas a este pacote
                         cur.execute("""
                             SELECT cve_id FROM vulnerability_records
                             WHERE package_name=%s AND ecosystem=%s
@@ -582,11 +636,11 @@ def stage3_apply_patches(conn):
                             package_name=pkg,
                             cves=cves,
                             installed_version=old_ver,
-                            ecosystem=ecosystem
+                            ecosystem=ecosystem,
+                            target_path=target_path  # Salva no diretório alvo
                         )
                         
                         if patch_data:
-                            # Salva o virtual patch no banco
                             cur.execute("""
                                 UPDATE vulnerability_records
                                 SET remediation_status='VIRTUAL_PATCH',
@@ -604,9 +658,9 @@ def stage3_apply_patches(conn):
                                 pkg, ecosystem
                             ))
                             virtual_patched += 1
-                            log(f"      ✅ Virtual Patch salvo: {patch_data['file_path']}")
+                            log(f"      ✅ Virtual Patch salvo em: {patch_data['file_path']}")
                         else:
-                            log(f"      ❌ Falha ao gerar Virtual Patch — marcando como FAILED", "WARN")
+                            log(f"      ❌ Falha ao gerar Virtual Patch", "WARN")
                             cur.execute("""
                                 UPDATE vulnerability_records
                                 SET remediation_status='FAILED',
@@ -617,7 +671,7 @@ def stage3_apply_patches(conn):
                             """, (pkg, ecosystem))
                             failed += 1
                     except ImportError:
-                        log(f"      ❌ gerar_virtual_patch não disponível — marcando como FAILED", "WARN")
+                        log(f"      ❌ gerar_virtual_patch não disponível", "WARN")
                         cur.execute("""
                             UPDATE vulnerability_records
                             SET remediation_status='FAILED',
@@ -628,11 +682,9 @@ def stage3_apply_patches(conn):
                         """, (pkg, ecosystem))
                         failed += 1
             else:
-                # Req 4.4: falhas parciais — registra e continua
                 log(f"      ❌ Falha no update: {result.stderr[:150]}", "WARN")
                 
-                # Tenta Virtual Patch mesmo quando o update falha
-                log(f"      🧠 Tentando Virtual Patch via IA como fallback...")
+                log(f"      🧠 Tentando Virtual Patch como fallback...")
                 try:
                     from ai_agent import gerar_virtual_patch
                     cur.execute("""
@@ -646,7 +698,8 @@ def stage3_apply_patches(conn):
                         package_name=pkg,
                         cves=cves,
                         installed_version=old_ver,
-                        ecosystem=ecosystem
+                        ecosystem=ecosystem,
+                        target_path=target_path
                     )
                     
                     if patch_data:
@@ -667,7 +720,6 @@ def stage3_apply_patches(conn):
                             pkg, ecosystem
                         ))
                         virtual_patched += 1
-                        log(f"      ✅ Virtual Patch gerado como fallback: {patch_data['file_path']}")
                     else:
                         cur.execute("""
                             UPDATE vulnerability_records
@@ -697,72 +749,83 @@ def stage3_apply_patches(conn):
 
 
 # ============================================================
-# STAGE 4: Re-scan de validação
-# Feito via trivy-action no workflow GitHub Actions
-# O framework registra o resultado quando o workflow informa
+# STAGE 4: Validação e push para o repositório alvo
 # ============================================================
-def stage4_validate_via_report(conn, execution_id, vulns_before, post_report_path="reports/report_post_patch.json"):
+def stage4_validate_and_push(conn, execution_id, vulns_before, target_path):
     """
-    Compara relatório pós-patch com total anterior.
-    AGORA: Mostra breakdown por ecossistema
-    O re-scan em si é executado pelo workflow (trivy-action),
-    não pelo Python — trivy não está no PATH deste processo.
+    Valida resultado e faz push das correções para o repositório alvo.
     """
     log("=" * 60)
-    log("STAGE 4 — Validação Pós-Patch (Multi-Linguagem)")
+    log("STAGE 4 — Validação e Push para Repositório Alvo")
     log("=" * 60)
 
-    if not os.path.exists(post_report_path):
-        log("Relatório pós-patch não encontrado — validação será feita pelo security gate em homolog.", "WARN")
-        return True  # Não bloqueia o pipeline aqui
+    # Tenta ler relatório pós-patch
+    post_report_path = "reports/report_post_patch.json"
+    success = True
+    
+    if os.path.exists(post_report_path):
+        try:
+            with open(post_report_path) as f:
+                post = json.load(f)
 
-    try:
-        with open(post_report_path) as f:
-            post = json.load(f)
-
-        vulns_after = 0
-        by_eco = {}
-        
-        for result in post.get("Results", []):
-            result_type = result.get("Type", "").lower()
+            vulns_after = 0
+            by_eco = {}
             
-            if "composer" in result_type:
-                eco = "PHP"
-            elif "npm" in result_type or "package" in result_type.lower():
-                eco = "Node.js"
-            elif "pip" in result_type or "poetry" in result_type:
-                eco = "Python"
-            else:
-                eco = "UNKNOWN"
+            for result in post.get("Results", []):
+                result_type = result.get("Type", "").lower()
+                
+                if "composer" in result_type:
+                    eco = "PHP"
+                elif "npm" in result_type or "package" in result_type.lower():
+                    eco = "Node.js"
+                elif "pip" in result_type or "poetry" in result_type:
+                    eco = "Python"
+                else:
+                    eco = "UNKNOWN"
+                
+                vuln_count = len(result.get("Vulnerabilities") or [])
+                vulns_after += vuln_count
+                by_eco[eco] = vuln_count
+
+            reduction = round((vulns_before - vulns_after) / vulns_before * 100, 2) if vulns_before > 0 else 0
+
+            log(f"\n📊 Resultados por ecossistema:")
+            for eco, count in sorted(by_eco.items()):
+                log(f"  {eco}: {count} vulnerabilidade(s)")
             
-            vuln_count = len(result.get("Vulnerabilities") or [])
-            vulns_after += vuln_count
-            by_eco[eco] = vuln_count
+            log(f"\n✅ Vulnerabilidades: {vulns_before} → {vulns_after} (redução: {reduction}%)")
 
-        reduction = round((vulns_before - vulns_after) / vulns_before * 100, 2) if vulns_before > 0 else 0
+            if execution_id:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE pipeline_executions
+                    SET vulnerabilities_resolved=%s, reduction_percentage=%s WHERE id=%s
+                """, (vulns_before - vulns_after, reduction, execution_id))
+                conn.commit()
+                cur.close()
 
-        log(f"\n📊 Resultados por ecossistema:")
-        for eco, count in sorted(by_eco.items()):
-            log(f"  {eco}: {count} vulnerabilidade(s)")
-        
-        log(f"\n✅ Vulnerabilidades: {vulns_before} → {vulns_after} (redução: {reduction}%)")
+            if vulns_after > 0:
+                log(f"⚠️  {vulns_after} vulnerabilidade(s) restantes", "WARN")
+                success = False
+        except Exception as e:
+            log(f"Erro ao ler relatório pós-patch: {e}", "WARN")
+    else:
+        log("Relatório pós-patch não encontrado — validação será feita pelo security gate.", "WARN")
 
-        if execution_id:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE pipeline_executions
-                SET vulnerabilities_resolved=%s, reduction_percentage=%s WHERE id=%s
-            """, (vulns_before - vulns_after, reduction, execution_id))
-            conn.commit()
-            cur.close()
+    # Commit e push das correções para o repositório alvo
+    run_id = os.getenv("GITHUB_RUN_ID", f"local-{int(time.time())}")
+    
+    if TARGET_REPO_URL:
+        log(f"\n📤 Enviando correções para o repositório alvo...")
+        branch = commit_and_push_patches(target_path, run_id, TARGET_BRANCH_FIX)
+        if branch:
+            log(f"✅ Correções enviadas para branch '{branch}' em {TARGET_REPO_URL}")
+        else:
+            log("⚠️  Não foi possível enviar correções para o repositório alvo", "WARN")
+    else:
+        log("TARGET_REPO_URL não configurado — correções mantidas apenas localmente")
 
-        if vulns_after > 0:
-            log(f"⚠️  {vulns_after} vulnerabilidade(s) restantes — serão validadas em homolog.", "WARN")
-
-        return vulns_after == 0
-    except Exception as e:
-        log(f"Erro ao ler relatório pós-patch: {e}", "WARN")
-        return True
+    return success
 
 
 # ============================================================
@@ -770,7 +833,7 @@ def stage4_validate_via_report(conn, execution_id, vulns_before, post_report_pat
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🔒 PIPELINE AUTÔNOMO DE REMEDIAÇÃO SCA (Multi-Linguagem)")
+    print("🔒 FRAMEWORK AUTÔNOMO DE REMEDIAÇÃO SCA")
     print("   IA como agente de segurança central")
     print("   Suporte: PHP (Composer) + Node.js (npm) + Python (pip)")
     print("=" * 60)
@@ -780,22 +843,28 @@ def main():
         log("reports/report.json não encontrado. Execute o Trivy primeiro.", "ERROR")
         sys.exit(1)
 
+    target_path = os.getcwd()
+    target_repo = get_target_repo_name()
+
     conn = connect_db()
     execution_id = None
     vulns_found  = 0
 
     try:
+        # Stage 0: clona repositório alvo (se configurado)
+        target_path, target_repo = stage0_clone_target()
+
         # Stage 1: carrega, enriquece e persiste (multi-linguagem)
-        execution_id, vulns_found = stage1_load_and_persist(conn)
+        execution_id, vulns_found = stage1_load_and_persist(conn, target_path)
 
         # Stage 2: IA analisa e decide (por ecossistema)
         stage2_ai_decide(conn)
 
-        # Stage 3: aplica patches (multi-linguagem com gerenciadores específicos)
-        remediated = stage3_apply_patches(conn)
+        # Stage 3: aplica patches no repositório alvo
+        remediated = stage3_apply_patches(conn, target_path)
 
-        # Stage 4: valida resultado (se relatório pós-patch existir)
-        success = stage4_validate_via_report(conn, execution_id, vulns_found)
+        # Stage 4: valida resultado e faz push
+        success = stage4_validate_and_push(conn, execution_id, vulns_found, target_path)
 
         # Req 12.1: finaliza registro
         status = "SUCCESS" if success else "PARTIAL"
@@ -807,7 +876,7 @@ def main():
             print("✅ PIPELINE CONCLUÍDO — Todas as vulnerabilidades remediadas")
         else:
             print("⚠️  PIPELINE CONCLUÍDO — Revisão manual necessária para itens restantes")
-        print("   (Todas as linguagens processadas: PHP, Node.js, Python)")
+        print(f"   Repositório alvo: {target_repo}")
         print("=" * 60)
 
     except Exception as e:
@@ -816,6 +885,9 @@ def main():
             db_safe(db_finish_execution, conn, execution_id, "FAILED", vulns_found, 0)
         raise
     finally:
+        # Limpa diretório temporário se foi clonado
+        if TARGET_REPO_URL and target_path and target_path != os.getcwd():
+            cleanup_target_repository(target_path)
         conn.close()
 
 
