@@ -3,37 +3,68 @@ name: DevSecOps - Security Gate (Homolog)
 # ============================================================
 # PIPELINE 2 - SECURITY GATE
 #
-# Disparada pela Pipeline 1 via workflow_dispatch.
+# Fluxo:
 #
-# Novo fluxo com repositórios externos:
-#   1. Recebe TARGET_REPO_URL via input
-#   2. Clona o repositório alvo na branch fix-remediation
-#   3. Executa Trivy + Smoke test
-#   4. Registra resultado no Supabase
-#   5. Se aprovado: abre PR fix-remediation → homolog no repo alvo
+# 1. Recebe a URL do repositório alvo
+# 2. Recebe a branch a ser validada
+# 3. Clona a branch corrigida usando PAT
+# 4. Executa novo scan Trivy
+# 5. Executa smoke tests
+# 6. Registra resultado no Supabase
+# 7. Se aprovado:
+#       cria PR fix-remediation -> homolog
+#       no REPOSITÓRIO ALVO
 #
-# A Pipeline 1 passa os parâmetros:
-#   - target_repo_url: URL do repositório legado
-#   - target_branch: branch com as correções (fix-remediation)
+# Disparada pela Pipeline 1 através de workflow_dispatch.
+#
+# Secrets necessários:
+#
+# PAT
+# DATABASE_URL
+#
+# O PAT deve permitir:
+# - leitura do repositório alvo
+# - criação de PR
+# - acesso ao workflow
 # ============================================================
 
+
 on:
+
   workflow_dispatch:
+
     inputs:
+
       target_repo_url:
         description: 'URL do repositório legado alvo'
         required: true
+        type: string
+
       target_branch:
         description: 'Branch a ser validada'
         required: true
         default: 'fix-remediation'
+        type: string
+
+
+# ============================================================
+# PERMISSÕES DO GITHUB ACTIONS
+# ============================================================
 
 permissions:
+
   contents: write
+
   pull-requests: write
+
   actions: read
 
+
 jobs:
+
+  # ==========================================================
+  # SECURITY GATE
+  # ==========================================================
 
   security-gate:
 
@@ -43,195 +74,569 @@ jobs:
 
     steps:
 
-      # ==========================================================
-      # FASE 0: CHECKOUT DO REPOSITÓRIO ALVO
-      # ==========================================================
 
-      - name: Clonar repositório legado (branch corrigida)
+      # ========================================================
+      # FASE 0
+      # DEFINIR VARIÁVEIS
+      # ========================================================
+
+      - name: Definir variáveis do repositório alvo
+
+        env:
+
+          REPO_URL_INPUT: ${{ github.event.inputs.target_repo_url }}
+
+          BRANCH_INPUT: ${{ github.event.inputs.target_branch }}
+
         run: |
-          REPO_URL="${{ github.event.inputs.target_repo_url }}"
-          BRANCH="${{ github.event.inputs.target_branch }}"
-          echo "📦 Clonando: $REPO_URL (branch: $BRANCH)"
-          git clone --depth 1 --branch "$BRANCH" "$REPO_URL" /tmp/target-repo
-          echo "TARGET_PATH=/tmp/target-repo" >> "$GITHUB_ENV"
-          echo "TARGET_REPO_URL=$REPO_URL" >> "$GITHUB_ENV"
-          echo "TARGET_BRANCH=$BRANCH" >> "$GITHUB_ENV"
-          echo "✅ Repositório clonado em /tmp/target-repo"
 
-      # ==========================================================
-      # FASE 1: INSTALAÇÃO DO TRIVY
-      # ==========================================================
+          if [ -z "$REPO_URL_INPUT" ]; then
+
+            echo "❌ target_repo_url não informado"
+
+            exit 1
+
+          fi
+
+
+          if [ -z "$BRANCH_INPUT" ]; then
+
+            echo "❌ target_branch não informado"
+
+            exit 1
+
+          fi
+
+
+          echo "TARGET_REPO_URL=$REPO_URL_INPUT" >> "$GITHUB_ENV"
+
+          echo "TARGET_BRANCH=$BRANCH_INPUT" >> "$GITHUB_ENV"
+
+
+          echo "📦 Repositório alvo configurado"
+
+          echo "📌 Branch: $BRANCH_INPUT"
+
+
+      # ========================================================
+      # FASE 0.1
+      # CLONAR REPOSITÓRIO ALVO
+      #
+      # Usa PAT para acessar repositório privado.
+      # ========================================================
+
+      - name: Clonar repositório alvo
+
+        env:
+
+          PAT: ${{ secrets.PAT }}
+
+        run: |
+
+          if [ -z "$PAT" ]; then
+
+            echo "❌ Secret PAT não configurado"
+
+            exit 1
+
+          fi
+
+
+          echo "📦 Clonando repositório alvo"
+
+          echo "📌 Branch: $TARGET_BRANCH"
+
+
+          git clone \
+            --depth 1 \
+            --branch "$TARGET_BRANCH" \
+            "https://x-access-token:${PAT}@${TARGET_REPO_URL#https://}" \
+            /tmp/target-repo
+
+
+          echo "✅ Repositório clonado com sucesso"
+
+
+          echo ""
+
+          echo "📁 Conteúdo do repositório:"
+
+          find /tmp/target-repo \
+            -maxdepth 2 \
+            -type f \
+            -not -path '*/.git/*' \
+            | head -50
+
+
+      # ========================================================
+      # FASE 1
+      # INSTALAR TRIVY
+      # ========================================================
 
       - name: Instalar Trivy
+
         run: |
-          sudo apt-get install -y wget gnupg lsb-release --quiet
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+
+          sudo apt-get update -qq
+
+          sudo apt-get install -y \
+            wget \
+            gnupg \
+            lsb-release \
+            --quiet
+
+
+          wget -qO - \
+            https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo apt-key add -
+
+
           echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
             | sudo tee /etc/apt/sources.list.d/trivy.list
+
+
           sudo apt-get update -qq
+
           sudo apt-get install -y trivy
+
+
           trivy --version
 
-      # ==========================================================
-      # FASE 1.1: RE-SCAN DE SEGURANÇA
-      # ==========================================================
+
+      # ========================================================
+      # FASE 1.1
+      # RE-SCAN DE SEGURANÇA
+      #
+      # O exit code é capturado manualmente.
+      # O job não para imediatamente.
+      # ========================================================
 
       - name: Re-scan Trivy
+
         id: trivy
-        continue-on-error: true
+
         run: |
-          set +e
+
           echo "🔍 Iniciando re-scan de segurança"
-          echo "📌 Repositório: ${{ github.event.inputs.target_repo_url }}"
-          echo "📌 Branch: ${{ github.event.inputs.target_branch }}"
+
+          echo "📌 Repositório: $TARGET_REPO_URL"
+
+          echo "📌 Branch: $TARGET_BRANCH"
+
+          echo ""
+
+
+          set +e
+
 
           trivy fs /tmp/target-repo \
             --format table \
             --severity CRITICAL,HIGH \
             --exit-code 1
 
+
           TRIVY_EXIT_CODE=$?
+
+
+          set -e
+
+
           echo "TRIVY_EXIT_CODE=$TRIVY_EXIT_CODE" >> "$GITHUB_ENV"
 
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "Resultado do Trivy: $TRIVY_EXIT_CODE"
+
+          echo "=========================================="
+
+
           if [ "$TRIVY_EXIT_CODE" -eq 0 ]; then
-            echo "=========================================="
-            echo "✅ Nenhuma vulnerabilidade CRITICAL/HIGH"
-            echo "=========================================="
+
+            echo "✅ Nenhuma vulnerabilidade CRITICAL/HIGH encontrada"
+
           else
-            echo "=========================================="
+
             echo "❌ Vulnerabilidades CRITICAL/HIGH persistem"
-            echo "=========================================="
-          fi
-          exit 0
 
-      # ==========================================================
-      # FASE 1.2: REGISTRO DO RESULTADO
-      # ==========================================================
-
-      - name: Registrar resultado do Trivy
-        run: |
-          if [ "${TRIVY_EXIT_CODE}" = "0" ]; then
-            echo "✅ Security Gate: APROVADO"
-          else
-            echo "❌ Security Gate: REJEITADO"
           fi
 
-      # ==========================================================
-      # FASE 2: SMOKE TEST PHP
-      # ==========================================================
 
-      - name: Smoke test PHP
-        if: hashFiles('/tmp/target-repo/composer.json') != '' || hashFiles('/tmp/target-repo/*.php') != ''
+      # ========================================================
+      # FASE 1.2
+      # SCAN JSON PARA REGISTRO
+      # ========================================================
+
+      - name: Gerar relatório Trivy JSON
+
         run: |
+
+          trivy fs /tmp/target-repo \
+            --format json \
+            --output /tmp/trivy-report.json \
+            --severity CRITICAL,HIGH
+
+
+          echo "✅ Relatório JSON gerado"
+
+          ls -lh /tmp/trivy-report.json
+
+
+      # ========================================================
+      # FASE 2
+      # INSTALAR PHP + COMPOSER
+      # ========================================================
+
+      - name: Instalar PHP + Composer
+
+        if: hashFiles('/tmp/target-repo/composer.json') != ''
+
+        run: |
+
           echo "📦 Projeto PHP detectado"
 
-          sudo apt-get install -y php-cli php-curl php-mbstring php-xml --quiet
 
-          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          sudo apt-get update -qq
+
+
+          sudo apt-get install -y \
+            php-cli \
+            php-curl \
+            php-mbstring \
+            php-xml \
+            --quiet
+
+
+          curl -sS https://getcomposer.org/installer \
+            | php -- \
+            --install-dir=/usr/local/bin \
+            --filename=composer
+
+
           composer --version
 
+
+      # ========================================================
+      # FASE 2.1
+      # SMOKE TEST PHP
+      # ========================================================
+
+      - name: Smoke test PHP
+
+        if: hashFiles('/tmp/target-repo/composer.json') != ''
+
+        run: |
+
+          echo "🧪 Executando smoke test PHP"
+
+
           if [ -f "/tmp/target-repo/composer.json" ]; then
-            composer install --no-interaction --no-progress --prefer-dist --working-dir=/tmp/target-repo
+
+            composer install \
+              --no-interaction \
+              --no-progress \
+              --prefer-dist \
+              --working-dir=/tmp/target-repo
+
           fi
 
-          PHP_FILES=$(find /tmp/target-repo -type f -name "*.php" -not -path "*/vendor/*" -not -path "*/.git/*")
+
+          PHP_FILES=$(find /tmp/target-repo \
+            -type f \
+            -name "*.php" \
+            -not -path "*/vendor/*" \
+            -not -path "*/.git/*")
+
+
           if [ -n "$PHP_FILES" ]; then
+
             echo "$PHP_FILES" | while read -r file; do
-              php -l "$file" && echo "✅ $file: sintaxe OK"
+
+              echo "🔍 Validando: $file"
+
+              php -l "$file"
+
             done
+
           else
+
             echo "ℹ️ Nenhum arquivo PHP encontrado"
+
           fi
 
-      # ==========================================================
-      # FASE 3: SMOKE TEST BÁSICO
-      # ==========================================================
+
+          echo "✅ Smoke test PHP concluído"
+
+
+      # ========================================================
+      # FASE 3
+      # SMOKE TEST BÁSICO
+      # ========================================================
 
       - name: Smoke test básico
+
         run: |
+
           echo "🔍 Validando estrutura do projeto"
-          TOTAL_FILES=$(find /tmp/target-repo -type f -not -path '*/.git/*' -not -path '*/vendor/*' | wc -l)
+
+
+          TOTAL_FILES=$(find /tmp/target-repo \
+            -type f \
+            -not -path '*/.git/*' \
+            -not -path '*/vendor/*' \
+            | wc -l)
+
+
           echo "📁 Total de arquivos: $TOTAL_FILES"
+
+
           if [ "$TOTAL_FILES" -eq 0 ]; then
+
             echo "❌ Nenhum arquivo encontrado"
+
             exit 1
+
           fi
+
+
           echo "✅ Estrutura do projeto íntegra"
 
-      # ==========================================================
-      # FASE 4: ATUALIZAÇÃO DO SUPABASE
-      # ==========================================================
+
+      # ========================================================
+      # FASE 4
+      # REGISTRO NO SUPABASE
+      # ========================================================
 
       - name: Registrar resultado no Supabase
+
         env:
+
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
           DB_SSLMODE: require
+
           GITHUB_RUN_ID: ${{ github.run_id }}
+
+          TARGET_REPO_URL: ${{ github.event.inputs.target_repo_url }}
+
         run: |
-          pip install psycopg2-binary python-dotenv --quiet
+
+          python -m pip install --upgrade pip
+
+          pip install \
+            psycopg2-binary \
+            python-dotenv \
+            --quiet
+
+
           python - <<'EOF'
-          import sys, os
+
+          import sys
+          import os
+
+
           sys.path.insert(0, "scripts")
+
+
           from db import connect_db
 
+
           conn = connect_db()
+
           cur = conn.cursor()
 
-          trivy_exit = os.environ.get("TRIVY_EXIT_CODE", "1")
-          workflow_run_id = os.environ.get("GITHUB_RUN_ID")
-          target_repo = os.environ.get("TARGET_REPO_URL", "unknown")
 
-          print(f"🔎 Repositório: {target_repo}")
-          print(f"🔎 Resultado Trivy: {trivy_exit}")
+          trivy_exit = os.environ.get(
+              "TRIVY_EXIT_CODE",
+              "1"
+          )
+
+
+          workflow_run_id = os.environ.get(
+              "GITHUB_RUN_ID"
+          )
+
+
+          target_repo = os.environ.get(
+              "TARGET_REPO_URL",
+              "unknown"
+          )
+
+
+          target_branch = os.environ.get(
+              "TARGET_BRANCH",
+              "unknown"
+          )
+
+
+          print(
+              f"🔎 Repositório: {target_repo}"
+          )
+
+
+          print(
+              f"🔎 Branch: {target_branch}"
+          )
+
+
+          print(
+              f"🔎 Resultado Trivy: {trivy_exit}"
+          )
+
 
           if trivy_exit == "0":
-              print("✅ Security Gate aprovado")
-              # Cria nova execução no Supabase para este security gate
-              cur.execute("""
+
+              print(
+                  "✅ Security Gate aprovado"
+              )
+
+
+              cur.execute(
+                  """
                   INSERT INTO pipeline_executions
-                      (repository_name, workflow_run_id, status, homolog_status, vulnerabilities_found, vulnerabilities_resolved, finished_at)
-                  VALUES (%s, %s, 'SUCCESS', 'VALIDATED', 0, 0, NOW())
-                  RETURNING id
-              """, (target_repo, workflow_run_id))
-              conn.commit()
-              print(f"✅ Registro de validação criado no Supabase")
+                      (
+                          repository_name,
+                          workflow_run_id,
+                          status,
+                          homolog_status,
+                          vulnerabilities_found,
+                          vulnerabilities_resolved,
+                          finished_at
+                      )
+                  VALUES
+                      (
+                          %s,
+                          %s,
+                          'SUCCESS',
+                          'VALIDATED',
+                          0,
+                          0,
+                          NOW()
+                      )
+                  """,
+                  (
+                      target_repo,
+                      workflow_run_id
+                  )
+              )
+
+
           else:
-              print("❌ Security Gate rejeitado")
-              cur.execute("""
+
+              print(
+                  "❌ Security Gate rejeitado"
+              )
+
+
+              cur.execute(
+                  """
                   INSERT INTO pipeline_executions
-                      (repository_name, workflow_run_id, status, homolog_status, vulnerabilities_found, vulnerabilities_resolved, finished_at)
-                  VALUES (%s, %s, 'FAILED', 'REJECTED', 0, 0, NOW())
-                  RETURNING id
-              """, (target_repo, workflow_run_id))
-              conn.commit()
-              print("❌ Rejeição registrada no Supabase")
+                      (
+                          repository_name,
+                          workflow_run_id,
+                          status,
+                          homolog_status,
+                          vulnerabilities_found,
+                          vulnerabilities_resolved,
+                          finished_at
+                      )
+                  VALUES
+                      (
+                          %s,
+                          %s,
+                          'FAILED',
+                          'REJECTED',
+                          0,
+                          0,
+                          NOW()
+                      )
+                  """,
+                  (
+                      target_repo,
+                      workflow_run_id
+                  )
+              )
+
+
+          conn.commit()
+
+
+          cur.close()
 
           conn.close()
-          print("✅ Supabase atualizado")
+
+
+          print(
+              "✅ Resultado registrado no Supabase"
+          )
+
           EOF
 
-      # ==========================================================
-      # FASE 5: CRIAÇÃO DO PR PARA HOMOLOG
+
+      # ========================================================
+      # FASE 5
+      # CRIAR PR PARA HOMOLOG
       #
-      # Executa SOMENTE se o Trivy validou (TRIVY_EXIT_CODE=0).
-      # Cria PR no REPOSITÓRIO ALVO: fix-remediation → homolog
-      # ==========================================================
+      # SOMENTE SE:
+      #
+      # TRIVY_EXIT_CODE = 0
+      #
+      # PR:
+      #
+      # fix-remediation -> homolog
+      #
+      # NO REPOSITÓRIO ALVO
+      # ========================================================
 
-      - name: Criar Pull Request para homolog (repositório alvo)
+      - name: Criar Pull Request para homolog
+
         if: env.TRIVY_EXIT_CODE == '0'
+
         env:
-          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+          GH_TOKEN: ${{ secrets.PAT }}
+
         run: |
-          REPO_URL="${{ github.event.inputs.target_repo_url }}"
-          BRANCH="${{ github.event.inputs.target_branch }}"
 
-          # Extrai owner/repo da URL
-          REPO_FULL=$(echo "$REPO_URL" | sed 's|https://github.com/||' | sed 's|\.git$||' | sed 's|git@github.com:||')
+          if [ -z "$GH_TOKEN" ]; then
 
-          echo "🔎 Verificando se já existe PR no repositório alvo"
-          echo "📌 Repositório: $REPO_FULL"
+            echo "❌ Secret PAT não configurado"
+
+            exit 1
+
+          fi
+
+
+          REPO_URL="$TARGET_REPO_URL"
+
+          BRANCH="$TARGET_BRANCH"
+
+
+          # ----------------------------------------------------
+          # Extrair owner/repo
+          # ----------------------------------------------------
+
+          REPO_FULL=$(echo "$REPO_URL" \
+            | sed 's|https://github.com/||' \
+            | sed 's|\.git$||' \
+            | sed 's|git@github.com:||')
+
+
+          echo "🔎 Repositório alvo: $REPO_FULL"
+
           echo "📌 Head: $BRANCH"
+
           echo "📌 Base: homolog"
+
+
+          # ----------------------------------------------------
+          # Verificar PR existente
+          # ----------------------------------------------------
+
+          echo "🔎 Verificando PR existente"
+
 
           EXISTING_PR=$(gh pr list \
             --repo "$REPO_FULL" \
@@ -239,15 +644,26 @@ jobs:
             --head "$BRANCH" \
             --state open \
             --json number \
-            --jq '.[0].number' 2>/dev/null || echo "")
+            --jq '.[0].number')
+
 
           if [ -n "$EXISTING_PR" ]; then
+
             echo "ℹ️ PR já existe: #$EXISTING_PR"
+
             echo "ℹ️ Nenhum novo PR será criado"
+
             exit 0
+
           fi
 
-          echo "🚀 Criando PR $BRANCH → homolog no repositório alvo"
+
+          # ----------------------------------------------------
+          # Criar PR
+          # ----------------------------------------------------
+
+          echo "🚀 Criando PR $BRANCH -> homolog"
+
 
           gh pr create \
             --repo "$REPO_FULL" \
@@ -256,16 +672,19 @@ jobs:
             --title "chore: remediação validada - promover para homolog" \
             --body "## 🔒 Remediação validada automaticamente
 
-          A branch \`$BRANCH\` passou pelo Security Gate.
+A branch \`$BRANCH\` passou pelo Security Gate.
 
-          ### Validações executadas
-          - ✅ Re-scan Trivy
-          - ✅ Nenhuma vulnerabilidade CRITICAL ou HIGH persistente
-          - ✅ Smoke test executado
-          - ✅ Estrutura do projeto validada
-          - ✅ Resultado registrado no Supabase
+### Validações executadas
 
-          ### Próximo passo
-          Aprovar o merge para homolog." \
-          && echo "✅ PR criado com sucesso no repositório alvo" \
-          || echo "⚠️  Não foi possível criar PR automática"
+- ✅ Re-scan Trivy
+- ✅ Nenhuma vulnerabilidade CRITICAL ou HIGH persistente
+- ✅ Smoke test executado
+- ✅ Estrutura do projeto validada
+- ✅ Resultado registrado no Supabase
+
+### Próximo passo
+
+Aprovar o merge da branch \`$BRANCH\` para \`homolog\`."
+
+
+          echo "✅ PR criado com sucesso"

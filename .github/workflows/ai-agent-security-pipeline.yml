@@ -3,143 +3,250 @@ name: DevSecOps - Remediação Automática
 # ============================================================
 # PIPELINE 1: SCAN + REMEDIAÇÃO
 #
-# Disparada por push em develop ou manualmente.
+# Fluxo:
 #
-# Novo fluxo com repositórios externos:
-#   1. Clona o repositório legado alvo (TARGET_REPO_URL)
-#   2. Executa Trivy sobre o repositório clonado
-#   3. framework.py processa stages 1-4 no repositório alvo
-#   4. Correções são commitadas e pushadas para o repositório alvo
-#   5. Dispara Pipeline 2 para validação
+# 1. Checkout do framework
+# 2. Clone do repositório alvo
+# 3. Scan SCA com Trivy
+# 4. Upload do relatório
+# 5. Novo job:
+#       - Checkout do framework
+#       - Download do relatório
+#       - Clone do repositório alvo
+#       - Execução do framework.py
+# 6. O framework aplica as correções
+# 7. O framework cria/push a branch fix-remediation
+# 8. Pipeline 2 é disparada para validação
 #
-# Variáveis de ambiente necessárias:
-#   - TARGET_REPO_URL: URL do repositório legado (ex: https://github.com/org/php_vuln_03.git)
-#   - TARGET_REPO_BRANCH: Branch do repositório alvo (default: main)
-#   - TARGET_BRANCH_FIX: Nome da branch de correção (default: fix-remediation)
-#   - PAT: Personal Access Token com permissão de push no repositório alvo
+# Secrets necessários:
+#
+# TARGET_REPO_URL
+# PAT
+# DATABASE_URL
+# GEMINI_API_KEY
+#
+# O PAT deve possuir permissão para:
+# - ler o repositório alvo
+# - criar branch
+# - fazer push
 # ============================================================
 
 on:
+
   push:
     branches:
       - develop
+
   workflow_dispatch:
+
     inputs:
+
       target_repo_url:
         description: 'URL do repositório legado alvo'
         required: false
         default: ''
+
       target_branch:
         description: 'Branch do repositório alvo'
         required: false
         default: 'main'
 
+
+# ============================================================
+# PERMISSÕES DO GITHUB ACTIONS
+# ============================================================
+
 permissions:
+
   contents: write
+
   pull-requests: write
+
   actions: write
+
 
 jobs:
 
-  # ============================================================
-  # JOB 1: SCAN DE VULNERABILIDADES NO REPOSITÓRIO ALVO
-  #
-  # Agora clona o repositório legado e executa o Trivy sobre ele.
-  # ============================================================
+  # ==========================================================
+  # JOB 1
+  # SCAN DE VULNERABILIDADES
+  # ==========================================================
 
   security-scan:
 
-    name: 🔍 Trivy SCA Scan (Repositório Alvo)
+    name: 🔍 Trivy SCA Scan - Repositório Alvo
 
     runs-on: ubuntu-latest
 
     steps:
 
-      # ----------------------------------------------------------
-      # Checkout do framework (apenas para reports/)
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # CHECKOUT DO FRAMEWORK
+      # --------------------------------------------------------
 
       - name: Checkout framework
+
         uses: actions/checkout@v4
+
         with:
           ref: develop
           fetch-depth: 1
 
-      # ----------------------------------------------------------
-      # Clonar repositório alvo
-      # ----------------------------------------------------------
 
-      - name: Clonar repositório legado
-        id: clone-target
+      # --------------------------------------------------------
+      # DEFINIR URL DO REPOSITÓRIO ALVO
+      # --------------------------------------------------------
+
+      - name: Definir repositório alvo
+
+        env:
+          TARGET_REPO_INPUT: ${{ github.event.inputs.target_repo_url }}
+          TARGET_REPO_SECRET: ${{ secrets.TARGET_REPO_URL }}
+
         run: |
-          REPO_URL="${{ github.event.inputs.target_repo_url || secrets.TARGET_REPO_URL || '' }}"
-          if [ -z "$REPO_URL" ]; then
-            echo "❌ TARGET_REPO_URL não configurado"
-            echo "   Configure como input manual do workflow ou como secret TARGET_REPO_URL"
-            exit 1
-          fi
-          echo "📦 Clonando: $REPO_URL"
-          git clone --depth 1 "$REPO_URL" /tmp/target-repo
-          echo "TARGET_PATH=/tmp/target-repo" >> "$GITHUB_ENV"
-          echo "TARGET_REPO_URL=$REPO_URL" >> "$GITHUB_ENV"
-          echo "✅ Repositório clonado em /tmp/target-repo"
 
-      # ----------------------------------------------------------
-      # Instalação do Trivy
-      # ----------------------------------------------------------
+          REPO_URL="${TARGET_REPO_INPUT:-$TARGET_REPO_SECRET}"
+
+          if [ -z "$REPO_URL" ]; then
+
+            echo "❌ TARGET_REPO_URL não configurado"
+
+            echo ""
+            echo "Configure:"
+            echo "  - Input manual target_repo_url"
+            echo "  OU"
+            echo "  - Secret TARGET_REPO_URL"
+
+            exit 1
+
+          fi
+
+          echo "TARGET_REPO_URL=$REPO_URL" >> "$GITHUB_ENV"
+
+          echo "📦 Repositório alvo configurado"
+
+
+      # --------------------------------------------------------
+      # CLONAR REPOSITÓRIO ALVO
+      #
+      # O PAT é usado para permitir acesso ao repositório alvo.
+      # --------------------------------------------------------
+
+      - name: Clonar repositório alvo
+
+        env:
+          PAT: ${{ secrets.PAT }}
+
+        run: |
+
+          if [ -z "$PAT" ]; then
+
+            echo "❌ Secret PAT não configurado"
+
+            exit 1
+
+          fi
+
+          echo "📦 Clonando repositório alvo..."
+
+          git clone \
+            --depth 1 \
+            "https://x-access-token:${PAT}@${TARGET_REPO_URL#https://}" \
+            /tmp/target-repo
+
+          echo "✅ Repositório alvo clonado"
+
+          echo "📁 Conteúdo:"
+
+          ls -la /tmp/target-repo
+
+
+      # --------------------------------------------------------
+      # INSTALAR TRIVY
+      # --------------------------------------------------------
 
       - name: Instalar Trivy
+
         run: |
-          sudo apt-get install -y wget gnupg lsb-release --quiet
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+
+          sudo apt-get update -qq
+
+          sudo apt-get install -y \
+            wget \
+            gnupg \
+            lsb-release \
+            --quiet
+
+          wget -qO - \
+            https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo apt-key add -
+
           echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
             | sudo tee /etc/apt/sources.list.d/trivy.list
+
           sudo apt-get update -qq
+
           sudo apt-get install -y trivy
 
-      # ----------------------------------------------------------
-      # Scan Trivy no repositório CLONADO (não no framework)
-      # ----------------------------------------------------------
 
-      - name: Scan JSON no repositório alvo
+      # --------------------------------------------------------
+      # SCAN JSON
+      # --------------------------------------------------------
+
+      - name: Scan Trivy - JSON
+
         run: |
+
           mkdir -p reports
+
           trivy fs /tmp/target-repo \
             --format json \
             --output reports/report.json \
             --skip-version-check
-          echo "📊 Scan concluído — relatório salvo em reports/report.json"
 
-      # ----------------------------------------------------------
-      # Scan tabela para visualização
-      # ----------------------------------------------------------
+          echo "✅ Scan Trivy concluído"
 
-      - name: Scan tabela para visualização
+          echo "📄 Relatório:"
+
+          ls -lh reports/report.json
+
+
+      # --------------------------------------------------------
+      # SCAN EM TABELA
+      # --------------------------------------------------------
+
+      - name: Scan Trivy - Tabela
+
         run: |
+
           trivy fs /tmp/target-repo \
             --format table \
             --severity CRITICAL,HIGH,MEDIUM \
             --skip-version-check \
             || true
 
-      # ----------------------------------------------------------
-      # Upload do relatório
-      # ----------------------------------------------------------
 
-      - name: Upload do relatório Trivy
+      # --------------------------------------------------------
+      # UPLOAD DO RELATÓRIO
+      # --------------------------------------------------------
+
+      - name: Upload relatório Trivy
+
         uses: actions/upload-artifact@v4
+
         with:
+
           name: trivy-report-${{ github.run_id }}
+
           path: reports/report.json
 
+          if-no-files-found: error
 
-  # ============================================================
-  # JOB 2: REMEDIAÇÃO AUTOMÁTICA
-  #
-  # Executa o framework.py sobre o repositório clonado.
-  # As correções são aplicadas no diretório temporário.
-  # O framework faz commit e push para o repositório alvo.
-  # ============================================================
+
+  # ==========================================================
+  # JOB 2
+  # REMEDIAÇÃO
+  # ==========================================================
 
   remediation:
 
@@ -152,164 +259,336 @@ jobs:
 
     steps:
 
-      # ----------------------------------------------------------
-      # Checkout do framework
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # CHECKOUT DO FRAMEWORK
+      # --------------------------------------------------------
 
       - name: Checkout framework
+
         uses: actions/checkout@v4
+
         with:
+
           ref: develop
+
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ----------------------------------------------------------
-      # Download do relatório
-      # ----------------------------------------------------------
+          token: ${{ secrets.PAT || github.token }}
 
-      - name: Download do relatório Trivy
+
+      # --------------------------------------------------------
+      # DOWNLOAD DO RELATÓRIO
+      # --------------------------------------------------------
+
+      - name: Download relatório Trivy
+
         uses: actions/download-artifact@v4
+
         with:
+
           name: trivy-report-${{ github.run_id }}
+
           path: reports/
 
-      # ----------------------------------------------------------
-      # Configuração do Python
-      # ----------------------------------------------------------
+
+      # --------------------------------------------------------
+      # CONFIGURAR PYTHON
+      # --------------------------------------------------------
 
       - name: Configurar Python
+
         uses: actions/setup-python@v5
+
         with:
+
           python-version: '3.10'
 
-      # ----------------------------------------------------------
-      # Instalação das dependências Python
-      # ----------------------------------------------------------
+
+      # --------------------------------------------------------
+      # INSTALAR DEPENDÊNCIAS
+      # --------------------------------------------------------
 
       - name: Instalar dependências Python
-        run: pip install -r requirements.txt --quiet
 
-      # ----------------------------------------------------------
-      # Instalar PHP + Composer (se necessário)
-      # ----------------------------------------------------------
+        run: |
+
+          python -m pip install --upgrade pip
+
+          pip install -r requirements.txt --quiet
+
+
+      # --------------------------------------------------------
+      # INSTALAR PHP + COMPOSER
+      # --------------------------------------------------------
 
       - name: Instalar PHP + Composer
+
         run: |
-          sudo apt-get install -y php-cli php-curl php-mbstring php-xml --quiet
-          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+          sudo apt-get update -qq
+
+          sudo apt-get install -y \
+            php-cli \
+            php-curl \
+            php-mbstring \
+            php-xml \
+            --quiet
+
+          curl -sS https://getcomposer.org/installer \
+            | php -- \
+            --install-dir=/usr/local/bin \
+            --filename=composer
+
           composer --version
 
-      # ----------------------------------------------------------
-      # Clonar repositório alvo novamente (para este job)
-      # ----------------------------------------------------------
 
-      - name: Clonar repositório legado
-        run: |
-          REPO_URL="${{ github.event.inputs.target_repo_url || secrets.TARGET_REPO_URL || '' }}"
-          if [ -z "$REPO_URL" ]; then
-            echo "❌ TARGET_REPO_URL não configurado"
-            exit 1
-          fi
-          echo "📦 Clonando: $REPO_URL"
-          git clone --depth 1 "$REPO_URL" /tmp/target-repo
-          echo "TARGET_PATH=/tmp/target-repo" >> "$GITHUB_ENV"
-          echo "TARGET_REPO_URL=$REPO_URL" >> "$GITHUB_ENV"
-          echo "✅ Repositório clonado em /tmp/target-repo"
+      # --------------------------------------------------------
+      # DEFINIR URL DO REPOSITÓRIO ALVO
+      # --------------------------------------------------------
 
-      # ==========================================================
-      # BANCO DE DADOS
-      # ==========================================================
+      - name: Definir repositório alvo
 
-      - name: Aplicar schema, migrations e seed no Supabase
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          DB_SSLMODE: require
+
+          TARGET_REPO_INPUT: ${{ github.event.inputs.target_repo_url }}
+
+          TARGET_REPO_SECRET: ${{ secrets.TARGET_REPO_URL }}
+
         run: |
+
+          REPO_URL="${TARGET_REPO_INPUT:-$TARGET_REPO_SECRET}"
+
+          if [ -z "$REPO_URL" ]; then
+
+            echo "❌ TARGET_REPO_URL não configurado"
+
+            exit 1
+
+          fi
+
+          echo "TARGET_REPO_URL=$REPO_URL" >> "$GITHUB_ENV"
+
+          echo "📦 Repositório alvo configurado"
+
+
+      # --------------------------------------------------------
+      # CLONAR REPOSITÓRIO ALVO
+      #
+      # IMPORTANTE:
+      #
+      # O framework.py também possui Stage 0 que clona o alvo.
+      #
+      # Portanto, esta etapa é necessária apenas se o framework
+      # for alterado para usar TARGET_PATH.
+      #
+      # Neste momento mantemos o clone porque o pipeline precisa
+      # garantir que o diretório alvo exista.
+      # --------------------------------------------------------
+
+      - name: Clonar repositório alvo
+
+        env:
+
+          PAT: ${{ secrets.PAT }}
+
+          TARGET_REPO_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
+
+        run: |
+
+          if [ -z "$PAT" ]; then
+
+            echo "❌ Secret PAT não configurado"
+
+            exit 1
+
+          fi
+
+          echo "📦 Clonando branch: $TARGET_REPO_BRANCH"
+
+          git clone \
+            --depth 1 \
+            --branch "$TARGET_REPO_BRANCH" \
+            "https://x-access-token:${PAT}@${TARGET_REPO_URL#https://}" \
+            /tmp/target-repo
+
+          echo "✅ Repositório alvo clonado"
+
+          cd /tmp/target-repo
+
+          git remote -v
+
+
+      # ========================================================
+      # BANCO DE DADOS
+      # ========================================================
+
+      - name: Preparar banco Supabase
+
+        env:
+
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          DB_SSLMODE: require
+
+        run: |
+
           python - <<'EOF'
+
           import sys
+
           sys.path.insert(0, "scripts")
+
           from db import connect_db
 
+
           conn = connect_db()
+
           cur = conn.cursor()
 
+
           with open("database/schema.sql") as f:
+
               cur.execute(f.read())
+
+
           conn.commit()
+
           print("✅ Schema principal aplicado")
 
+
           with open("database/migrate_add_previous_version.sql") as f:
+
               cur.execute(f.read())
+
+
           conn.commit()
+
           print("✅ Migrations aplicadas")
+
 
           cur.execute("""
               DELETE FROM homologated_versions
               WHERE package_name = 'guzzlehttp/psr7'
                 AND safe_version = '1.9.1'
           """)
+
+
           conn.commit()
+
           print("✅ Cleanup executado")
 
+
           try:
+
               with open("database/seed_homologated_versions.sql") as f:
+
                   cur.execute(f.read())
+
+
               conn.commit()
+
               print("✅ Seed aplicado")
+
+
           except Exception as e:
+
               conn.rollback()
-              print(f"⚠️ Seed já existente: {e}")
+
+              print(f"⚠️ Seed já existente ou não aplicado: {e}")
+
+
+          cur.close()
 
           conn.close()
+
+
           print("✅ Banco de dados preparado")
+
           EOF
 
-      # ==========================================================
-      # EXECUÇÃO DO AGENTE DE IA
-      #
-      # O framework.py agora:
-      #   - Stage 0: verifica TARGET_REPO_URL, clona se necessário
-      #   - Stage 1: lê report.json do alvo
-      #   - Stage 2: IA decide remediação
-      #   - Stage 3: patches no diretório clonado
-      #   - Stage 4: commit + push para o repositório alvo
-      # ==========================================================
+
+      # ========================================================
+      # EXECUTAR FRAMEWORK
+      # ========================================================
 
       - name: Executar Agente de IA
+
         env:
+
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
           DB_SSLMODE: require
+
           GITHUB_REPOSITORY: ${{ github.repository }}
+
           GITHUB_RUN_ID: ${{ github.run_id }}
+
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
           TARGET_REPO_URL: ${{ github.event.inputs.target_repo_url || secrets.TARGET_REPO_URL || '' }}
+
           TARGET_REPO_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
+
           TARGET_BRANCH_FIX: fix-remediation
+
           MIN_SEVERITY: HIGH
+
           AI_MODEL: gemini-2.5-flash
+
           AI_TEMPERATURE: "0.1"
+
           AI_MAX_TOKENS: "600"
-          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+          GH_TOKEN: ${{ secrets.PAT || github.token }}
+
+          GITHUB_TOKEN: ${{ secrets.PAT || github.token }}
+
         run: |
+
+          echo "🚀 Iniciando framework de remediação"
+
+          echo "📌 Repositório alvo: $TARGET_REPO_URL"
+
+          echo "📌 Branch origem: $TARGET_REPO_BRANCH"
+
+          echo "📌 Branch correção: $TARGET_BRANCH_FIX"
+
+          echo ""
+
           python framework.py
 
 
-      # ==========================================================
-      # DISPARO EXPLÍCITO DA PIPELINE 2
-      #
-      # A Pipeline 2 validará o repositório alvo na branch
-      # fix-remediation e abrirá PR para homolog.
-      # ==========================================================
+      # ========================================================
+      # DISPARAR PIPELINE 2
+      # ========================================================
 
       - name: Disparar Pipeline 2 - Security Gate
+
         if: success()
+
         env:
-          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+          GH_TOKEN: ${{ secrets.PAT || github.token }}
+
         run: |
+
           REPO_URL="${{ github.event.inputs.target_repo_url || secrets.TARGET_REPO_URL || '' }}"
+
+          if [ -z "$REPO_URL" ]; then
+
+            echo "❌ TARGET_REPO_URL não configurado"
+
+            exit 1
+
+          fi
+
+
           echo "🚀 Disparando Pipeline 2"
+
           echo "📌 Repositório alvo: $REPO_URL"
+
           echo "📌 Branch: fix-remediation"
+
 
           gh workflow run homolog-security-gate.yml \
             --repo "${{ github.repository }}" \
@@ -317,5 +596,7 @@ jobs:
             -f target_repo_url="$REPO_URL" \
             -f target_branch="fix-remediation"
 
+
           echo "✅ Pipeline 2 solicitada com sucesso"
-          echo "🔍 A validação será executada sobre o repositório alvo"
+
+          echo "🔍 A validação será executada sobre a branch fix-remediation"
