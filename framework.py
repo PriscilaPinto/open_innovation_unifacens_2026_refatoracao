@@ -63,6 +63,7 @@ from db import connect_db
 from context_collector import (
     detect_ecosystem,
     detect_ecosystems,
+    clone_target_repository,
 )
 
 
@@ -348,11 +349,24 @@ def db_finish_execution(
 
 def stage0_validate_target():
     """
-    O repositório alvo já é clonado pelo GitHub Actions.
+    Valida e, quando necessário, clona o repositório alvo.
 
-    Portanto, este estágio NÃO executa git clone.
+    Tabela de decisão (cinco ramificações):
 
-    Apenas valida se o diretório existe.
+      A — TARGET_PATH existe e contém .git/
+          → reutiliza diretório existente.
+
+      B — TARGET_PATH existe, sem .git/, TARGET_REPO_URL configurada
+          → remove diretório inconsistente e clona novamente.
+
+      C — TARGET_PATH existe, sem .git/, sem TARGET_REPO_URL
+          → registra aviso e continua sem clonar (compatibilidade).
+
+      D — TARGET_PATH não existe e TARGET_REPO_URL configurada
+          → clona o repositório remoto.
+
+      E — TARGET_PATH não existe e sem TARGET_REPO_URL
+          → log de erro e sys.exit(1).
     """
 
     log("=" * 60)
@@ -378,48 +392,114 @@ def stage0_validate_target():
         f"{TARGET_PATH}"
     )
 
-    if not os.path.exists(TARGET_PATH):
+    git_dir = os.path.join(TARGET_PATH, ".git")
+
+    path_exists = os.path.exists(TARGET_PATH)
+    has_git = path_exists and os.path.exists(git_dir)
+
+    if path_exists and has_git:
+
+        # ── Branch A ─────────────────────────────────────────
+        # Diretório existe e é um repositório Git válido.
+        # Comportamento idêntico ao original.
 
         log(
-            f"❌ Diretório do repositório alvo "
-            f"não encontrado: {TARGET_PATH}",
-            "ERROR"
+            f"✅ repositório alvo detectado como existente: "
+            f"{TARGET_PATH}"
         )
 
-        log(
-            "O workflow deve executar o clone "
-            "antes de chamar framework.py.",
-            "ERROR"
-        )
-
-        sys.exit(1)
-
-    if not os.path.isdir(TARGET_PATH):
-
-        log(
-            f"❌ TARGET_PATH não é um diretório: "
-            f"{TARGET_PATH}",
-            "ERROR"
-        )
-
-        sys.exit(1)
-
-    if not os.path.exists(
-        os.path.join(
+        return (
             TARGET_PATH,
-            ".git"
+            get_target_repo_name()
         )
-    ):
+
+    if path_exists and not has_git:
+
+        if TARGET_REPO_URL:
+
+            # ── Branch B ─────────────────────────────────────
+            # Diretório existe mas não é um repositório Git,
+            # e a URL remota está configurada.
+            # Remove o diretório inconsistente e clona.
+
+            log(
+                f"⚠️ Diretório '{TARGET_PATH}' existe mas não é "
+                "um repositório Git válido. "
+                "TARGET_REPO_URL configurada — "
+                "removendo diretório inconsistente e clonando.",
+                "WARN"
+            )
+
+            shutil.rmtree(TARGET_PATH, ignore_errors=True)
+
+            # fall through to clone logic below
+
+        else:
+
+            # ── Branch C ─────────────────────────────────────
+            # Diretório existe mas não é um repositório Git,
+            # e TARGET_REPO_URL não está configurada.
+            # Registra aviso e continua sem clonar.
+
+            log(
+                f"⚠️ Diretório '{TARGET_PATH}' existe mas não é "
+                "um repositório Git válido e "
+                "TARGET_REPO_URL não está configurada. "
+                "Continuando sem clonar.",
+                "WARN"
+            )
+
+            return (
+                TARGET_PATH,
+                get_target_repo_name()
+            )
+
+    else:
+
+        # path_exists is False
+        if not TARGET_REPO_URL:
+
+            # ── Branch E ─────────────────────────────────────
+            # Diretório não existe e URL remota não configurada.
+
+            log(
+                f"❌ Diretório '{TARGET_PATH}' não existe e "
+                "TARGET_REPO_URL não está configurada. "
+                "Impossível prosseguir.",
+                "ERROR"
+            )
+
+            sys.exit(1)
+
+        # ── Branch D ─────────────────────────────────────────
+        # Diretório não existe mas URL remota está configurada.
+        # fall through to clone logic below
+
+    # ── Clone (Branches B e D) ────────────────────────────────
+    log(
+        f"📥 Clonando repositório remoto: "
+        f"{TARGET_REPO_URL}"
+    )
+
+    cloned_path = clone_target_repository(
+        TARGET_REPO_URL,
+        branch=TARGET_REPO_BRANCH,
+        target_path=TARGET_PATH
+    )
+
+    if cloned_path is None:
 
         log(
-            "⚠️ Diretório encontrado, "
-            "mas não parece ser um repositório Git.",
-            "WARN"
+            f"❌ Falha ao clonar o repositório "
+            f"'{TARGET_REPO_URL}' em '{TARGET_PATH}'.",
+            "ERROR"
         )
+
+        sys.exit(1)
 
     log(
-        f"✅ Repositório alvo validado: "
-        f"{TARGET_PATH}"
+        f"✅ Repositório clonado com sucesso em: "
+        f"{cloned_path}"
     )
 
     return (
@@ -1288,6 +1368,101 @@ def run_smoke_test(
 # VIRTUAL PATCH
 # ============================================================
 
+def validate_virtual_patch(
+    patch_data: dict,
+    ecosystem: str
+) -> bool:
+    """
+    Validates a generated virtual patch before it is persisted.
+
+    Performs three sequential checks:
+      1. Existence  — the file reported in patch_data["file_path"] must exist.
+      2. Size       — the file must be larger than 50 bytes.
+      3. Syntax     — ecosystem-aware syntax check via subprocess:
+                      Python  → py_compile
+                      PHP     → php -l
+                      Node.js → node --check
+                      Others  → skipped (returns True immediately)
+
+    Returns True only when all applicable checks pass.
+    On any failure, logs a warning and returns False.
+    On syntax failure, also attempts to remove the invalid file.
+
+    Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7
+    """
+
+    # ── Step 1 — Existence check ─────────────────────────────
+    file_path = patch_data["file_path"]
+
+    if not os.path.isfile(file_path):
+
+        log(
+            f"⚠️ validate_virtual_patch: "
+            f"arquivo não encontrado: {file_path}",
+            "WARN"
+        )
+
+        return False
+
+    # ── Step 2 — Size check ──────────────────────────────────
+    if os.path.getsize(file_path) <= 50:
+
+        log(
+            f"⚠️ validate_virtual_patch: "
+            f"arquivo muito pequeno (≤ 50 bytes): {file_path}",
+            "WARN"
+        )
+
+        return False
+
+    # ── Step 3 — Syntax check (ecosystem-dependent) ──────────
+    if ecosystem == "Python":
+
+        cmd = [sys.executable, "-m", "py_compile", file_path]
+
+    elif ecosystem == "PHP":
+
+        cmd = ["php", "-l", file_path]
+
+    elif ecosystem == "Node.js":
+
+        cmd = ["node", "--check", file_path]
+
+    else:
+
+        # Unknown / unsupported ecosystem — skip syntax check
+        return True
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+
+    if result.returncode != 0:
+
+        log(
+            f"⚠️ validate_virtual_patch: "
+            f"sintaxe inválida para {ecosystem} "
+            f"(returncode={result.returncode}): "
+            f"{result.stderr[:200]}",
+            "WARN"
+        )
+
+        try:
+
+            os.remove(file_path)
+
+        except OSError:
+
+            pass
+
+        return False
+
+    return True
+
+
 def generate_virtual_patch(
     cur,
     pkg,
@@ -1545,21 +1720,69 @@ def stage3_apply_patches(
                         "WARN"
                     )
 
-                    subprocess.run(
+                    # ── Ecosystem-aware manifest list ─────────
+                    if ecosystem == "PHP":
+                        revert_files = [
+                            "composer.json",
+                            "composer.lock",
+                        ]
+                    elif ecosystem == "Node.js":
+                        revert_files = [
+                            "package.json",
+                            "package-lock.json",
+                        ]
+                    else:
+                        # Python
+                        revert_files = [
+                            "requirements.txt",
+                        ]
+
+                    revert_result = subprocess.run(
                         [
                             "git",
                             "checkout",
                             "--",
-                            "composer.json",
-                            "composer.lock",
-                            "package.json",
-                            "package-lock.json",
-                            "requirements.txt"
-                        ],
+                        ] + revert_files,
                         cwd=target_path,
                         capture_output=True,
                         text=True
                     )
+
+                    if revert_result.returncode != 0:
+
+                        log(
+                            f"❌ git checkout de reversão "
+                            f"falhou (rc="
+                            f"{revert_result.returncode}): "
+                            f"{revert_result.stderr[:300]}",
+                            "ERROR"
+                        )
+
+                        cur.execute(
+                            """
+                            UPDATE vulnerability_records
+                            SET
+                                remediation_status =
+                                    'FAILED',
+                                updated_at = NOW()
+                            WHERE package_name = %s
+                              AND ecosystem = %s
+                              AND decision_status =
+                                    'APPROVED'
+                              AND remediation_status =
+                                    'OPEN'
+                            """,
+                            (
+                                pkg,
+                                ecosystem
+                            )
+                        )
+
+                        conn.commit()
+
+                        total_failed += 1
+
+                        continue
 
                     patch_data = (
                         generate_virtual_patch(
@@ -1573,14 +1796,51 @@ def stage3_apply_patches(
 
                     if patch_data:
 
+                        if not validate_virtual_patch(
+                            patch_data,
+                            ecosystem
+                        ):
+
+                            try:
+                                os.remove(
+                                    patch_data["file_path"]
+                                )
+                            except OSError:
+                                pass
+
+                            cur.execute(
+                                """
+                                UPDATE vulnerability_records
+                                SET
+                                    remediation_status =
+                                        'FAILED',
+                                    updated_at = NOW()
+                                WHERE package_name = %s
+                                  AND ecosystem = %s
+                                  AND decision_status =
+                                        'APPROVED'
+                                  AND remediation_status =
+                                        'OPEN'
+                                """,
+                                (
+                                    pkg,
+                                    ecosystem
+                                )
+                            )
+
+                            conn.commit()
+
+                            total_failed += 1
+
+                            continue
+
                         cur.execute(
                             """
                             UPDATE vulnerability_records
                             SET
                                 remediation_status =
                                     'VIRTUAL_PATCH',
-                                previous_version =
-                                    installed_version,
+                                previous_version = %s,
                                 virtual_patch_path =
                                     %s,
                                 virtual_patch_data =
@@ -1594,6 +1854,7 @@ def stage3_apply_patches(
                                     'OPEN'
                             """,
                             (
+                                old_ver,
                                 patch_data[
                                     "file_path"
                                 ],
@@ -1603,6 +1864,12 @@ def stage3_apply_patches(
                                 pkg,
                                 ecosystem
                             )
+                        )
+
+                        log(
+                            f"📄 Virtual patch salvo: "
+                            f"{patch_data['file_path']} "
+                            f"({len(patch_data['patch_code'])} bytes)"
                         )
 
                         total_virtual_patched += 1
@@ -1631,14 +1898,49 @@ def stage3_apply_patches(
 
                 if patch_data:
 
+                    if not validate_virtual_patch(
+                        patch_data,
+                        ecosystem
+                    ):
+
+                        try:
+                            os.remove(
+                                patch_data["file_path"]
+                            )
+                        except OSError:
+                            pass
+
+                        cur.execute(
+                            """
+                            UPDATE vulnerability_records
+                            SET
+                                remediation_status =
+                                    'FAILED',
+                                updated_at = NOW()
+                            WHERE package_name = %s
+                              AND ecosystem = %s
+                              AND decision_status =
+                                    'APPROVED'
+                              AND remediation_status =
+                                    'OPEN'
+                            """,
+                            (
+                                pkg,
+                                ecosystem
+                            )
+                        )
+
+                        total_failed += 1
+
+                        continue
+
                     cur.execute(
                         """
                         UPDATE vulnerability_records
                         SET
                             remediation_status =
                                 'VIRTUAL_PATCH',
-                            previous_version =
-                                installed_version,
+                            previous_version = %s,
                             virtual_patch_path =
                                 %s,
                             virtual_patch_data =
@@ -1652,6 +1954,7 @@ def stage3_apply_patches(
                                 'OPEN'
                         """,
                         (
+                            old_ver,
                             patch_data[
                                 "file_path"
                             ],
@@ -1661,6 +1964,12 @@ def stage3_apply_patches(
                             pkg,
                             ecosystem
                         )
+                    )
+
+                    log(
+                        f"📄 Virtual patch salvo: "
+                        f"{patch_data['file_path']} "
+                        f"({len(patch_data['patch_code'])} bytes)"
                     )
 
                     total_virtual_patched += 1
