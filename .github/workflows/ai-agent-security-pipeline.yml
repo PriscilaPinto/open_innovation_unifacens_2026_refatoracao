@@ -136,29 +136,40 @@ jobs:
 
         env:
           PAT: ${{ secrets.PAT }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
 
         run: |
 
           if [ -z "$PAT" ]; then
-
             echo "❌ Secret PAT não configurado"
-
             exit 1
-
           fi
 
-          echo "📦 Clonando repositório alvo..."
+          if [ -z "$TARGET_REPO_URL" ]; then
+            echo "❌ TARGET_REPO_URL está vazio neste step"
+            exit 1
+          fi
+
+          echo "📦 Clonando repositório alvo: $TARGET_REPO_URL"
+          echo "🌿 Branch: $TARGET_BRANCH"
 
           git clone \
             --depth 1 \
+            --branch "$TARGET_BRANCH" \
             "https://x-access-token:${PAT}@${TARGET_REPO_URL#https://}" \
             /tmp/target-repo
 
           echo "✅ Repositório alvo clonado"
-
-          echo "📁 Conteúdo:"
-
+          echo "📁 Conteúdo de /tmp/target-repo:"
           ls -la /tmp/target-repo
+
+          # Garantir que o clone não está vazio
+          FILE_COUNT=$(find /tmp/target-repo -type f | wc -l)
+          echo "📊 Total de arquivos: $FILE_COUNT"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ Diretório clonado está vazio — abortando scan"
+            exit 1
+          fi
 
 
       # --------------------------------------------------------
@@ -199,16 +210,24 @@ jobs:
 
           mkdir -p reports
 
+          echo "🔍 Escaneando: /tmp/target-repo"
+          echo "📁 Arquivos encontrados:"
+          find /tmp/target-repo -type f -not -path '*/.git/*' | head -30
+
           trivy fs /tmp/target-repo \
             --format json \
             --output reports/report.json \
-            --skip-version-check
+            --skip-version-check \
+            --pkg-types os,library \
+            --scanners vuln
 
           echo "✅ Scan Trivy concluído"
 
           echo "📄 Relatório:"
-
           ls -lh reports/report.json
+
+          echo "📊 Conteúdo do relatório (primeiras 50 linhas):"
+          head -50 reports/report.json
 
 
       # --------------------------------------------------------
@@ -223,6 +242,8 @@ jobs:
             --format table \
             --severity CRITICAL,HIGH,MEDIUM \
             --skip-version-check \
+            --pkg-types os,library \
+            --scanners vuln \
             || true
 
 
@@ -463,7 +484,17 @@ jobs:
 
           conn.commit()
 
-          print("✅ Migrations aplicadas")
+          print("✅ Migration previous_version aplicada")
+
+
+          with open("database/migrate_add_virtual_patch_columns.sql") as f:
+
+              cur.execute(f.read())
+
+
+          conn.commit()
+
+          print("✅ Migration virtual_patch_columns aplicada")
 
 
           cur.execute("""
