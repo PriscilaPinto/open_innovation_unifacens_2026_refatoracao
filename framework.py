@@ -64,6 +64,7 @@ from context_collector import (
     detect_ecosystem,
     detect_ecosystems,
     clone_target_repository,
+    commit_and_push_patches,
 )
 
 
@@ -2228,6 +2229,52 @@ def main():
                 target_path
             )
         )
+
+        # ----------------------------------------------------
+        # COMMIT + PUSH DA BRANCH DE REMEDIAÇÃO
+        # ----------------------------------------------------
+
+        if remediated > 0:
+
+            run_id = os.getenv(
+                "GITHUB_RUN_ID",
+                f"local-{int(time.time())}"
+            )
+
+            log(
+                "📤 Criando e enviando branch "
+                f"'{TARGET_BRANCH_FIX}'..."
+            )
+
+            pushed_branch = commit_and_push_patches(
+                target_path,
+                run_id,
+                target_branch=TARGET_BRANCH_FIX
+            )
+
+            if pushed_branch:
+
+                log(
+                    f"✅ Branch '{pushed_branch}' "
+                    "publicada com sucesso."
+                )
+
+            else:
+
+                log(
+                    "❌ Falha ao publicar a branch "
+                    f"'{TARGET_BRANCH_FIX}'. "
+                    "O Security Gate não poderá "
+                    "validar a remediação.",
+                    "ERROR"
+                )
+
+        else:
+
+            log(
+                "ℹ️ Nenhuma remediação aplicada. "
+                "Nenhuma branch será criada."
+            )
 
         # ----------------------------------------------------
         # STAGE 4

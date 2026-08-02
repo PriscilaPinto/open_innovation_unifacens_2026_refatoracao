@@ -427,7 +427,6 @@ jobs:
           echo "📦 Clonando branch: $TARGET_REPO_BRANCH"
 
           git clone \
-            --depth 1 \
             --branch "$TARGET_REPO_BRANCH" \
             "https://x-access-token:${PAT}@${TARGET_REPO_URL#https://}" \
             /tmp/target-repo
